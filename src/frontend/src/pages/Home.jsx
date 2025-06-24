@@ -478,7 +478,7 @@ const Home = ({ idToken, setIdToken }) => {
                     fontSize: '1.5rem', // Larger text
                     color: '#1f2937'
                   }}>
-                    Finn - Your Sport Shopping Assistant
+                    Finn - Your Sports Shopping Assistant
                   </h3>
                 </div>
                 <button 
