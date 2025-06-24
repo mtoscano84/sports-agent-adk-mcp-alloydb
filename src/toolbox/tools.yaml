@@ -1,0 +1,532 @@
+authServices:
+  google_signin:
+    kind: google
+    clientId: 316231368980-kiq70m8c1ijbbp8f9a6nis46maq6vhpi.apps.googleusercontent.com
+sources:
+  my-alloydb-pg-source:
+    kind: alloydb-postgres
+    project: sports-store-agent-ai
+    region: us-central1
+    cluster: alloydb-cluster
+    instance: alloydb-inst
+    database: store
+    user: postgres
+    password: alloydb
+tools:
+  search-products-by-description:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Search for sport products based on an a user description. 
+                Return the name, brand, category, description and popularity score of the product.
+    parameters:
+      - name: description
+        type: string
+        description: User description of the product they're looking for.
+    statement: |
+      SELECT 
+        name, 
+        description, 
+        1 - (embedding <=> embedding('text-embedding-005',$1)::vector) as similarity_score
+      FROM 
+        products 
+      ORDER BY 
+        similarity_score DESC
+      LIMIT 5;
+  search-product-by-size:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Search for products based on a size provided by the user. Return the name, brand, category, size and price of the product.
+    parameters:
+      - name: size
+        type: string
+        description: Size provided by the user.
+    statement: |
+      SELECT 
+          p.name,
+          p.brand,
+          p.category,
+          pv.size,
+          pv.price
+      FROM 
+          products p
+          JOIN products_variants pv ON p.product_id = pv.product_id
+      WHERE 
+          p.category = 'Running' 
+          AND pv.size = $1
+      ORDER BY 
+          p.brand, p.name;
+  tell-more-details-about-product:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Tell more details about a product by product name. Return the name, brand, category, description, available sizes, colors and prices.
+    parameters:
+      - name: product_name
+        type: string
+        description: Name of the product to show details for.
+    statement: |
+      SELECT
+        p.name AS "Product Name",
+      (SELECT pv_sub.price FROM products_variants pv_sub WHERE pv_sub.product_id = p.product_id LIMIT 1) AS "Price",
+      p.brand AS "Brand",
+      p.category AS "Category",
+      -- Subquery to get distinct sizes, order them, and then aggregate
+      (
+      SELECT STRING_AGG(DISTINCT_sizes.size_val, ', ' ORDER BY DISTINCT_sizes.size_val)
+      FROM (SELECT DISTINCT pv_inner.size::text AS size_val FROM products_variants pv_inner WHERE pv_inner.product_id = p.product_id) AS DISTINCT_sizes
+      ) AS "Sizes",
+      -- Subquery to get distinct colors, order them, and then aggregate
+      (
+      SELECT STRING_AGG(DISTINCT_colors.color_val, ', ' ORDER BY DISTINCT_colors.color_val)
+      FROM (SELECT DISTINCT pv_inner.color AS color_val FROM products_variants pv_inner WHERE pv_inner.product_id = p.product_id) AS DISTINCT_colors
+      ) AS "Colors",
+        p.description AS "Description"
+      FROM
+        products p
+      WHERE
+        LOWER(p.name) = LOWER($1)
+      GROUP BY
+      p.product_id, p.name, p.brand, p.category, p.description;
+  search-products-by-brand:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Search for products by brand name. Extract only the brand name from the user's query. For example, from "I want to see Nike products" extract just "Nike". Return the name, brand, category, description and price of the product.
+    parameters:
+      - name: brand
+        type: string
+        description: Brand name extracted from the user query (e.g., "Nike", "Adidas", "Hoka").
+    statement: |
+      WITH ProcessedQuery AS (
+        SELECT websearch_to_tsquery('english', $1) AS query_condition
+      )
+      SELECT DISTINCT
+        p.name,
+        p.brand,
+        p.category,
+        p.description,
+        pv.price,
+        ts_rank_cd(to_tsvector('english', p.brand), q.query_condition) as relevance_score
+      FROM
+        products p
+        JOIN products_variants pv ON p.product_id = pv.product_id
+        CROSS JOIN ProcessedQuery q
+      WHERE
+        to_tsvector('english', p.brand) @@ q.query_condition
+      ORDER BY
+        relevance_score DESC,
+        p.name ASC
+      LIMIT 5;
+  add-product-to-shopping-list:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Add a product with specific size and color to the shopping list for the user, using their email from Google Sign-In.
+    parameters:
+      - name: product_name
+        type: string
+        description: The name of the product.
+      - name: user_email
+        type: string
+        description: Auto-populated from Google login
+        authServices:
+          - name: google_signin
+            field: email
+      - name: size
+        type: string
+        description: The size of the product (e.g., "40", "S", "One Size").
+      - name: color
+        type: string
+        description: The color of the product (e.g., "Black/White", "Blue").
+    statement: |
+      WITH user_lookup AS (
+        SELECT user_id FROM users WHERE email = $2
+      ),
+      new_list AS (
+        -- Get or create a shopping list for the user
+        INSERT INTO shopping_lists (user_id)
+        SELECT user_id FROM user_lookup
+        WHERE NOT EXISTS (
+          SELECT 1 FROM shopping_lists WHERE user_id = (SELECT user_id FROM user_lookup)
+        )
+        RETURNING list_id
+      ),
+      existing_list AS (
+        -- Get existing list if it exists
+        SELECT list_id FROM shopping_lists WHERE user_id = (SELECT user_id FROM user_lookup)
+      ),
+      list_to_use AS (
+        -- Combine new and existing list IDs
+        SELECT list_id FROM new_list
+        UNION ALL
+        SELECT list_id FROM existing_list
+      ),
+      product_to_add AS (
+        -- Get the product_id from the name
+        SELECT product_id
+        FROM products
+        WHERE LOWER(name) = LOWER($1)
+        LIMIT 1
+      ),
+      variant_to_add AS (
+        -- Get the specific variant based on product_id, size, and color
+        SELECT variant_id 
+        FROM products_variants pv
+        JOIN product_to_add pta ON pv.product_id = pta.product_id
+        WHERE size = $3 
+          AND color = $4
+        LIMIT 1
+      )
+      INSERT INTO shopping_list_items (list_id, variant_id, quantity)
+      SELECT l.list_id, v.variant_id, 1
+      FROM list_to_use l
+      CROSS JOIN variant_to_add v
+      LIMIT 1
+      RETURNING list_id;
+  show-shopping-list:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Show the shopping list for the currently signed-in user. The user_email is automatically provided from the user's Google account. Do NOT ask the user for their user ID.
+    parameters:
+      - name: user_email
+        type: string
+        description: Auto-populated from Google login
+        authServices:
+          - name: google_signin
+            field: email
+    statement: |
+      SELECT 
+        STRING_AGG(
+          '• Product: ' || p.name || E'\n' ||
+          '  Brand: ' || p.brand || E'\n' ||
+          '  Category: ' || p.category || E'\n' ||
+          '  Size: ' || pv.size || E'\n' ||
+          '  Color: ' || pv.color || E'\n' ||
+          '  Price: €' || pv.price || E'\n' ||
+          '  Quantity: ' || sli.quantity || E'\n',
+          E'\n'
+        ) as shopping_list
+      FROM 
+        shopping_lists sl
+        JOIN shopping_list_items sli ON sl.list_id = sli.list_id
+        JOIN products_variants pv ON pv.variant_id = sli.variant_id
+        JOIN products p ON p.product_id = pv.product_id
+        JOIN users u ON sl.user_id = u.user_id
+      WHERE 
+        u.email = $1
+      GROUP BY 
+        sl.list_id
+      ORDER BY 
+        sl.list_id;
+  find-stores-by-user:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Search stores by user ID. First get user location, then find nearby stores.
+    parameters:
+      - name: user_email
+        type: string
+        description: Auto-populated from Google login
+        authServices:
+          - name: google_signin
+            field: email
+    statement: |
+      WITH user_info AS (
+        SELECT 
+          'USER|' || 
+          '0,' || 
+          ST_X(location::geometry)::numeric(10,6) || ',' || 
+          ST_Y(location::geometry)::numeric(10,6) as location_info,
+          location as user_location
+        FROM users 
+        WHERE email = $1
+      ),
+      store_info AS (
+        SELECT 
+          s.name || '|' || 
+          ST_Distance(s.location, u.user_location)::integer || ',' || 
+          ST_X(s.location::geometry)::numeric(10,6) || ',' || 
+          ST_Y(s.location::geometry)::numeric(10,6) as location_info
+        FROM stores s, user_info u
+        ORDER BY s.location <-> u.user_location
+        LIMIT 3
+      )
+      SELECT string_agg(location_info, E'\n')
+      FROM (
+        SELECT location_info FROM user_info
+        UNION ALL
+        SELECT location_info FROM store_info
+      ) all_locations;
+  place-order:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Place an order from the user's shopping list by store name and user id.
+    parameters:
+      - name: user_email
+        type: string
+        description: Auto-populated from Google login
+        authServices:
+          - name: google_signin
+            field: email
+      - name: store_name
+        type: string
+        description: The name of the store fulfilling the order.
+    statement: |
+      WITH user_lookup AS (
+        SELECT user_id FROM users WHERE email = $1
+      ),
+      shopping_list AS (
+        SELECT 
+          sli.variant_id,
+          sli.quantity,
+          pv.price as current_price,
+          p.name as product_name,
+          CONCAT('Size: ', pv.size, ', Color: ', pv.color) as variant_details
+        FROM shopping_lists sl
+        JOIN shopping_list_items sli ON sl.list_id = sli.list_id
+        JOIN products_variants pv ON sli.variant_id = pv.variant_id
+        JOIN products p ON pv.product_id = p.product_id
+        WHERE sl.user_id = (SELECT user_id FROM user_lookup)
+      ),
+      store_to_use AS (
+        SELECT store_id
+        FROM stores
+        WHERE LOWER(name) = LOWER($2)
+        LIMIT 1
+      ),
+      user_address AS (
+        SELECT CONCAT(address, ', ', city, ' ', postal_code) as full_address
+        FROM users
+        WHERE email = $1
+      ),
+      standard_delivery AS (
+        SELECT delivery_method_id, base_cost
+        FROM delivery_methods
+        WHERE store_id = (SELECT store_id FROM store_to_use)
+          AND name = 'Standard Home Delivery'
+      ),
+      new_order AS (
+        INSERT INTO orders (
+          user_id,
+          store_id,
+          delivery_method_id,
+          shipping_address,
+          shipping_cost,
+          total_amount
+        )
+        SELECT 
+          (SELECT user_id FROM user_lookup),
+          s.store_id,
+          d.delivery_method_id,
+          ua.full_address,
+          d.base_cost,
+          d.base_cost + (SELECT SUM(quantity * current_price) FROM shopping_list)
+        FROM store_to_use s
+        CROSS JOIN standard_delivery d
+        CROSS JOIN user_address ua
+        RETURNING order_id
+      )
+      INSERT INTO order_items (
+        order_id,
+        variant_id,
+        quantity,
+        price_at_purchase,
+        product_name_at_purchase,
+        variant_details_at_purchase
+      )
+      SELECT 
+        o.order_id,
+        sl.variant_id,
+        sl.quantity,
+        sl.current_price,
+        sl.product_name,
+        sl.variant_details
+      FROM new_order o
+      CROSS JOIN shopping_list sl
+      RETURNING order_id;
+  check-order-status-by-user:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Check orders status by user id. Return the order_id, total, status and delivery method.
+    parameters:
+      - name: user_email
+        type: string
+        description: Auto-populated from Google login
+        authServices:
+          - name: google_signin
+            field: email
+    statement: |
+      WITH user_lookup AS (
+        SELECT user_id FROM users WHERE email = $1
+      ),
+      order_items_agg AS (
+        SELECT 
+          order_id,
+          STRING_AGG(
+            '- ' || product_name_at_purchase || 
+            ' (' || variant_details_at_purchase || ')' ||
+            ' x' || quantity ||
+            ' €' || price_at_purchase,
+            E'\n'
+          ) as items_list
+        FROM order_items
+        GROUP BY order_id
+      )
+      SELECT 
+        STRING_AGG(
+          'Order #' || o.order_id || E'\n' ||
+          'Store: ' || s.name || E'\n' ||
+          'Total Amount: €' || o.total_amount || E'\n' ||
+          'Shipping Address: ' || o.shipping_address || E'\n' ||
+          'Delivery Method: ' || dm.name || ' (€' || dm.base_cost || ')' || E'\n' ||
+          'Status: ' || o.order_status || E'\n' ||
+          'Items:' || E'\n' || 
+          oi.items_list,
+          E'\n\n'
+        ) as orders
+      FROM orders o
+      JOIN stores s ON o.store_id = s.store_id
+      JOIN delivery_methods dm ON o.delivery_method_id = dm.delivery_method_id
+      JOIN order_items_agg oi ON o.order_id = oi.order_id
+      WHERE o.user_id = (SELECT user_id FROM user_lookup)
+      GROUP BY o.user_id
+      ORDER BY o.user_id;
+  list-delivery-methods-by-store:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: List delivery methods by store name. Return the method name, description, cost and estimated delivery time.
+    parameters:
+      - name: store_name
+        type: string
+        description: The name of the store.
+    statement: |
+      WITH store_to_use AS (
+        SELECT store_id
+        FROM stores
+        WHERE LOWER(name) = LOWER($1)
+      ),
+      delivery_info AS (
+        SELECT 
+          name,
+          description,
+          base_cost,
+          estimated_delivery_time
+        FROM delivery_methods
+        WHERE store_id = (SELECT store_id FROM store_to_use)
+        ORDER BY base_cost ASC
+      )
+      SELECT 
+        STRING_AGG(
+          '• ' || name || E'\n' ||
+          '  Description: ' || COALESCE(description, 'No description available') || E'\n' ||
+          '  Cost: €' || base_cost || E'\n' ||
+          '  Estimated Delivery Time: ' || COALESCE(estimated_delivery_time, 'Not specified') || E'\n',
+          E'\n'
+        ) as delivery_methods
+      FROM delivery_info;
+  update-order-delivery-method:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Update the delivery method of an order using the delivery method name.
+    parameters:
+      - name: order_id
+        type: integer
+        description: The order id.
+      - name: delivery_method_name
+        type: string
+        description: The name of the delivery method (e.g., "Express Delivery", "Standard Home Delivery").
+    statement: |
+      WITH order_store AS (
+        SELECT store_id
+        FROM orders
+        WHERE order_id = $1
+      ),
+      new_delivery AS (
+        SELECT delivery_method_id, base_cost
+        FROM delivery_methods
+        WHERE name = $2
+        AND store_id = (SELECT store_id FROM order_store)
+      ),
+      order_subtotal AS (
+        SELECT SUM(subtotal_line_item) as items_total
+        FROM order_items
+        WHERE order_id = $1
+      )
+      UPDATE orders 
+      SET 
+        delivery_method_id = (SELECT delivery_method_id FROM new_delivery),
+        shipping_cost = (SELECT base_cost FROM new_delivery),
+        total_amount = (SELECT items_total FROM order_subtotal) + (SELECT base_cost FROM new_delivery),
+        order_status = 'pending'
+      WHERE order_id = $1
+      AND EXISTS (SELECT 1 FROM new_delivery)
+      RETURNING order_id;
+  cancel-order-by-user:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Cancel an order by user.
+    parameters:
+      - name: order_id
+        type: integer
+        description: The order id.
+      - name: user_email
+        type: string
+        description: Auto-populated from Google login
+        authServices:
+          - name: google_signin
+            field: email
+    statement: |
+      WITH user_lookup AS (
+        SELECT user_id FROM users WHERE email = $2
+      )
+      UPDATE orders 
+      SET order_status = 'cancelled' 
+      WHERE order_id = $1 
+        AND user_id = (SELECT user_id FROM user_lookup)
+        AND order_status = 'pending'
+      RETURNING order_id;
+  get-user-id-by-name:
+    kind: postgres-sql
+    source: my-alloydb-pg-source
+    description: Get the user ID from their name
+    parameters:
+      - name: name
+        type: string
+        description: The user's first name
+    statement: |
+      SELECT user_id 
+      FROM users 
+      WHERE LOWER(first_name) = LOWER($1);
+  check-inventory-by-store-brand-category:
+    kind: alloydb-ai-nl
+    source: my-alloydb-pg-source
+    description: "Show the available products by store, brand and category. Return the number of products available"
+    nlConfig: "finn_app_config"
+    nlConfigParameters:
+      - name: user_email
+        type: string
+        description: User ID of the logged in user.
+        authServices:
+          - name: google_signin
+            field: email
+      - name: store_name
+        type: string
+        description: The name of the store.
+      - name: category
+        type: string
+        description: The category of the product.
+      - name: brand
+        type: string
+        description: The brand of the product.
+toolsets:
+  my-toolset:
+    - search-products-by-description
+    - search-product-by-size
+    - tell-more-details-about-product
+    - search-products-by-brand
+    - add-product-to-shopping-list
+    - show-shopping-list
+    - find-stores-by-user
+    - place-order
+    - check-order-status-by-user
+    - list-delivery-methods-by-store
+    - update-order-delivery-method
+    - cancel-order-by-user
+    - get-user-id-by-name
+    - check-inventory-by-store-brand-category
