@@ -172,7 +172,7 @@ artifacts_service = InMemoryArtifactService()
 
 vertexai.init(project=PROJECT_ID, location=LOCATION)
 
-llm = Gemini(model="gemini-2.5-flash-preview-05-20")
+llm = Gemini(model="gemini-2.5-flash")
 
 async def header_retriever(request: Request):
     """Get the ID token from the request headers"""
